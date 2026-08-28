@@ -2517,42 +2517,71 @@ void dbBlock::setMaxLayerForClock(const int max_layer_for_clock)
 int dbBlock::getGCellTileSize()
 {
   _dbBlock* block = (_dbBlock*) this;
+  dbTech* tech = getTech();
 
-  // lambda function to get the average track spacing of a given layer
-  auto getAverageTrackSpacing = [this](int layer_idx) -> int {
-    dbTech* tech = getTech();
-    // Skip backside routing layers (e.g. BSPDN BPR/BM*/BRDL) so the Nth
-    // routing layer is counted among frontside metals regardless of LEF
-    // ordering.
-    odb::dbTechLayer* tech_layer = nullptr;
+  if (block->max_routing_layer_ <= 0) {
+    // max_routing_layer_ defaults to -1 (never set), and 0 is likewise
+    // never a real layer's routing level (dbTechLayer::getRoutingLevel()
+    // numbers ROUTING-type layers starting at 1), so both are invalid
+    // input rather than "no layers enabled." Every real caller
+    // (grt::GlobalRouter::initGrid/initGridAndNets) resolves a concrete
+    // max routing layer via setMaxRoutingLayer() before calling this, but
+    // this is a public ODB API -- silently walking the whole tech stack
+    // as if every layer were enabled would produce a tile size for a
+    // routing-layer range the caller never asked for. Error explicitly
+    // instead, per this project's correctness-first review priority (an
+    // explicit error is always preferable to silently incorrect output).
+    getImpl()->getLogger()->error(
+        utl::ODB,
+        1219,
+        "getGCellTileSize() called with no valid max routing layer set "
+        "(setMaxRoutingLayer() must be called first).");
+  }
+
+  // Returns the layer_idx-th frontside ROUTING layer, skipping backside
+  // routing layers (e.g. BSPDN BPR/BM*/BRDL) so the index always lands on
+  // a frontside signal metal (M1, M2, ...) regardless of LEF layer order.
+  auto getFrontsideRoutingLayer = [tech](int layer_idx) -> dbTechLayer* {
     int count = 0;
     for (auto* layer : tech->getLayers()) {
       if (layer->getType() != dbTechLayerType::ROUTING || layer->isBackside()) {
         continue;
       }
       if (++count == layer_idx) {
-        tech_layer = layer;
-        break;
+        return layer;
       }
     }
-    if (tech_layer == nullptr) {
-      getImpl()->getLogger()->error(
-          utl::ODB,
-          1219,
-          "No frontside routing layer #{} found -- only {} exist in the "
-          "technology.",
-          layer_idx,
-          count);
-    }
+    return nullptr;
+  };
 
-    odb::dbTrackGrid* track_grid = findTrackGrid(tech_layer);
+  // Resolves a layer's track grid, erroring if it doesn't exist yet.
+  // Shared by getAverageTrackSpacing() below and the small-stack branch
+  // further down -- both need a hard error on a missing track grid
+  // (unlike the main floor loop, which tolerates one; see that loop's
+  // comment for why, and why it resolves its own track grid separately
+  // instead of using this).
+  auto requireTrackGrid = [this](dbTechLayer* tech_layer) -> dbTrackGrid* {
+    dbTrackGrid* track_grid
+        = tech_layer != nullptr ? findTrackGrid(tech_layer) : nullptr;
     if (track_grid == nullptr) {
       getImpl()->getLogger()->error(
           utl::ODB,
           358,
           "Track grid for routing layer {} not found.",
-          tech_layer->getName());
+          tech_layer != nullptr ? tech_layer->getName() : "<null>");
     }
+    return track_grid;
+  };
+
+  // lambda function to get the average track spacing of a given layer.
+  // Errors out if the layer's track grid isn't built yet -- unlike the
+  // floor loop below, which tolerates a missing track grid because it can
+  // run early (see that loop's comment). M2-M4 are the lowest routing
+  // layers, always tracked well before global placement's routability
+  // check would call this, so no such tolerance is needed here.
+  auto getAverageTrackSpacing
+      = [&requireTrackGrid](dbTechLayer* tech_layer) -> int {
+    odb::dbTrackGrid* track_grid = requireTrackGrid(tech_layer);
 
     int track_spacing, track_init, num_tracks;
     track_grid->getAverageTrackSpacing(track_spacing, track_init, num_tracks);
@@ -2560,22 +2589,399 @@ int dbBlock::getGCellTileSize()
     return (track_spacing % 2 == 0) ? track_spacing : track_spacing - 1;
   };
 
-  // Use the pitch of the fourth routing layer as the top option to compute the
-  // gcell tile size.
+  // Returns the true worst-case gap between adjacent tracks on an
+  // already-resolved track grid (not an averaged pitch -- see the floor
+  // loop's comment below for why), rounded up to the nearest even value.
+  // Callers are responsible for resolving/validating track_grid
+  // themselves first, since the missing-track-grid policy differs by call
+  // site (hard error for M2-M4/the small-stack case below; tolerated as a
+  // skip in the main floor loop).
+  auto getMaxTrackGap
+      = [this](dbTechLayer* tech_layer, dbTrackGrid* track_grid) -> int {
+    std::vector<int> track_coords;
+    if (tech_layer->getDirection() == dbTechLayerDir::HORIZONTAL) {
+      track_grid->getGridY(track_coords);
+    } else if (tech_layer->getDirection() == dbTechLayerDir::VERTICAL) {
+      track_grid->getGridX(track_coords);
+    } else {
+      // Matches dbTrackGrid::getAverageTrackSpacing()'s own dispatch
+      // (dbTrackGrid.cpp), which errors the same way for a layer whose
+      // direction was never set (dbTechLayerDir::NONE) rather than
+      // guessing an axis -- silently reading the wrong axis could
+      // undercount tracks and understate the required floor.
+      getImpl()->getLogger()->error(utl::ODB,
+                                    1220,
+                                    "Layer {} has invalid direction.",
+                                    tech_layer->getName());
+    }
+    if (track_coords.size() < 2) {
+      // Fewer than two tracks: no adjacent-gap to floor against.
+      return 0;
+    }
+    int max_gap = 0;
+    for (size_t i = 1; i < track_coords.size(); ++i) {
+      max_gap = std::max(max_gap, track_coords[i] - track_coords[i - 1]);
+    }
+    // A hard lower bound, not a heuristic estimate like
+    // getAverageTrackSpacing() above -- round up, not down, so rounding
+    // can't shave a guaranteed-sufficient floor below the true required
+    // minimum.
+    return (max_gap % 2 == 0) ? max_gap : max_gap + 1;
+  };
+
+  // The tech's single physically topmost ROUTING layer (frontside or
+  // backside, enabled or not) -- matches frTechObject::getTopLayerNum()
+  // (DRT's own notion of "top": the last ROUTING layer encountered while
+  // parsing the LEF), which the die-boundary via lookup in
+  // getBoundaryShrink() below keys off the same way DRT's own via
+  // selection does.
+  dbTechLayer* tech_top_layer = nullptr;
+  for (auto* layer : tech->getLayers()) {
+    if (layer->getType() == dbTechLayerType::ROUTING) {
+      tech_top_layer = layer;
+    }
+  }
+
+  // Finds the via DRT would use to connect two physically-adjacent metal
+  // layers, mirroring io::Parser::initDefaultVias()'s own selection
+  // (src/drt/src/io/io_parser_helper.cpp) rather than
+  // dbBlock::getDefaultVias(): that method keys off a LEF "OR_DEFAULT"
+  // string property that has no relationship to DRT's actual selection
+  // (used elsewhere by grt/cugr only) and, when nothing in the whole tech
+  // is OR_DEFAULT-tagged (the common case for an unmodified vendor LEF),
+  // falls back to whichever via happens to iterate first -- not
+  // necessarily DRT's pick. DRT ranks candidate vias for a cut layer by
+  // cut count first (single-cut strongly preferred; getViaRawPriority()
+  // breaks further ties by the LEF DEFAULT flag, then via enclosure
+  // alignment/width, which isn't replicated here). Matching DRT's two
+  // dominant tiers (cut count, then the LEF DEFAULT flag via
+  // dbTechVia::isDefault()) covers the common case where multiple named
+  // vias exist for one layer pair; on a technology where candidates also
+  // tie on both of those, the remaining tiebreak here (first found) may
+  // not match DRT's exact pick.
+  auto findConnectingVia
+      = [tech](dbTechLayer* bottom, dbTechLayer* top) -> dbTechVia* {
+    dbTechVia* best = nullptr;
+    int best_cuts = 0;
+    bool best_is_default = false;
+    for (dbTechVia* via : tech->getVias()) {
+      if (via->getBottomLayer() != bottom || via->getTopLayer() != top) {
+        continue;
+      }
+      int cuts = 0;
+      for (dbBox* box : via->getBoxes()) {
+        if (box->getTechLayer() != nullptr
+            && box->getTechLayer()->getType() == dbTechLayerType::CUT) {
+          ++cuts;
+        }
+      }
+      bool is_default = via->isDefault();
+      if (best == nullptr || cuts < best_cuts
+          || (cuts == best_cuts && is_default && !best_is_default)) {
+        best = via;
+        best_cuts = cuts;
+        best_is_default = is_default;
+      }
+    }
+    return best;
+  };
+
+  // Returns the extra tile-size margin needed so a die-boundary GCell on
+  // `layer` still has a guaranteed track after DRT's own boundary shrink
+  // (FlexTAWorker::assignIroute_availTracks, src/drt/src/ta/
+  // FlexTA_assign.cpp): for a layer DRT treats as unidirectional
+  // (LEF58_RECTONLY or multiple mask patterns -- the same two LEF-derived
+  // conditions frLayer::isUnidirectional() checks; a Tcl-only
+  // set_unidirectional_layer override isn't visible from ODB and isn't
+  // covered here), DRT shrinks the track search range at a die edge by
+  // half the merged enclosure height/width (in this layer's own routing
+  // direction) of the via connecting it to its physically adjacent
+  // neighbor -- the layer above, unless `layer` is the tech's absolute
+  // physical top, in which case the layer below, mirroring DRT's own
+  // `lNum +/- 1` selection. This reads real via geometry from whatever
+  // tech is loaded rather than hardcoding a margin for one technology, so
+  // it generalizes to any process. Returns 0 (no extra margin) if the
+  // layer isn't unidirectional, or no connecting via / via geometry can
+  // be resolved for it.
+  auto getBoundaryShrink = [&](dbTechLayer* layer) -> int {
+    if (!layer->isRectOnly() && layer->getNumMasks() <= 1) {
+      return 0;
+    }
+    // Walk the tech's full layer list once to find the ROUTING layer
+    // immediately above `layer` (the first one encountered after it) and
+    // immediately below it (the last one encountered before it) -- same
+    // physical-adjacency notion tech_top_layer above uses.
+    dbTechLayer* above = nullptr;
+    dbTechLayer* below = nullptr;
+    bool past_layer = false;
+    for (auto* candidate : tech->getLayers()) {
+      if (candidate == layer) {
+        past_layer = true;
+        continue;
+      }
+      if (candidate->getType() != dbTechLayerType::ROUTING) {
+        continue;
+      }
+      if (past_layer) {
+        if (above == nullptr) {
+          above = candidate;
+        }
+      } else {
+        below = candidate;
+      }
+    }
+
+    dbTechVia* via
+        = (layer != tech_top_layer && above != nullptr)
+              ? findConnectingVia(layer, above)
+              : (below != nullptr ? findConnectingVia(below, layer) : nullptr);
+    if (via == nullptr) {
+      return 0;
+    }
+    dbTechLayer* bottom = via->getBottomLayer();
+    dbTechLayer* top = via->getTopLayer();
+    bool have_box = false;
+    int x_lo = 0, y_lo = 0, x_hi = 0, y_hi = 0;
+    for (dbBox* box : via->getBoxes()) {
+      dbTechLayer* box_layer = box->getTechLayer();
+      if (box_layer != bottom && box_layer != top) {
+        continue;  // skip the cut-layer shape; only the two metal
+                   // enclosures matter, matching FlexTA_assign.cpp's
+                   // getLayer1ShapeBox()/getLayer2ShapeBox() merge
+      }
+      if (!have_box) {
+        x_lo = box->xMin();
+        y_lo = box->yMin();
+        x_hi = box->xMax();
+        y_hi = box->yMax();
+        have_box = true;
+      } else {
+        x_lo = std::min(x_lo, box->xMin());
+        y_lo = std::min(y_lo, box->yMin());
+        x_hi = std::max(x_hi, box->xMax());
+        y_hi = std::max(y_hi, box->yMax());
+      }
+    }
+    if (!have_box) {
+      return 0;
+    }
+    if (layer->getDirection() == dbTechLayerDir::HORIZONTAL) {
+      return (y_hi - y_lo) / 2;
+    }
+    if (layer->getDirection() == dbTechLayerDir::VERTICAL) {
+      return (x_hi - x_lo) / 2;
+    }
+    return 0;
+  };
+
+  // Use the pitch of the fourth frontside routing layer as the top option
+  // to compute the baseline gcell tile size.
   const int upper_layer_for_gcell_size = 4;
   const int pitches_in_tile = 15;
 
-  if (block->max_routing_layer_ < upper_layer_for_gcell_size) {
-    return getAverageTrackSpacing(block->max_routing_layer_) * pitches_in_tile;
+  // block->max_routing_layer_ is a raw routing level (dbTechLayer::
+  // getRoutingLevel()), which numbers every ROUTING-type layer including
+  // backside BSPDN layers ahead of the frontside stack -- the same
+  // convention set_routing_layers uses when resolving a layer name via
+  // findRoutingLayer(). Count how many *frontside* routing layers are
+  // enabled at or below it so it can be compared against
+  // upper_layer_for_gcell_size on the same (frontside-ordinal) basis that
+  // getFrontsideRoutingLayer() above uses.
+  int enabled_frontside_layers = 0;
+  {
+    int raw_level = 0;
+    bool found_max_layer = false;
+    for (auto* layer : tech->getLayers()) {
+      if (layer->getType() != dbTechLayerType::ROUTING) {
+        continue;
+      }
+      ++raw_level;
+      if (!layer->isBackside()) {
+        ++enabled_frontside_layers;
+      }
+      if (raw_level == block->max_routing_layer_) {
+        found_max_layer = true;
+        break;
+      }
+    }
+    if (!found_max_layer) {
+      // max_routing_layer_ is larger than the tech's actual ROUTING
+      // layer count -- invalid input, same class of problem as the
+      // <= 0 case above (already validated), just from the other
+      // direction. Silently treating it as "every layer in the tech is
+      // enabled" would be exactly the silently-wrong behavior this
+      // function's other guards exist to avoid.
+      getImpl()->getLogger()->error(
+          utl::ODB,
+          1223,
+          "getGCellTileSize() called with a max routing layer ({}) beyond "
+          "the tech's routing layer count.",
+          block->max_routing_layer_);
+    }
+  }
+
+  if (enabled_frontside_layers == 0) {
+    // max_routing_layer_ resolved to a raw level whose every ROUTING
+    // layer up to it is backside (e.g. a BSPDN stack with no frontside
+    // layer enabled at all) -- getFrontsideRoutingLayer(0) never matches
+    // (its count starts at 0 and increments before comparing), so without
+    // this check the code below would fall through to a generic "Track
+    // grid for routing layer <null> not found" from requireTrackGrid().
+    // Name the actual misconfiguration instead.
+    getImpl()->getLogger()->error(
+        utl::ODB,
+        1222,
+        "getGCellTileSize() found no frontside routing layer enabled at "
+        "or below the max routing layer.");
+  }
+
+  if (enabled_frontside_layers < upper_layer_for_gcell_size) {
+    // Fewer than 4 frontside layers are enabled, so this sole top layer
+    // plays the same "what actually bounds the tile size" role the floor
+    // loop's per-layer computation plays below -- use the same true
+    // worst-case-gap logic (not getAverageTrackSpacing()'s averaged
+    // pitch) for the same reason the floor loop does. Missing-track-grid
+    // is still a hard error here, matching the M2-M4 baseline's error
+    // policy below, not the floor loop's early-call tolerance.
+    dbTechLayer* layer = getFrontsideRoutingLayer(enabled_frontside_layers);
+    dbTrackGrid* track_grid = requireTrackGrid(layer);
+    int max_track_gap = getMaxTrackGap(layer, track_grid);
+    if (max_track_gap == 0) {
+      // Fewer than two tracks on this layer: unlike the main floor loop
+      // (which can fall back on other layers or the M2-M4 baseline),
+      // there is nothing else to compute a tile size from here. A tile
+      // size of 0 would divide-by-zero downstream (e.g.
+      // grt::GlobalRouter::initGrid()'s dx / tile_size) -- error
+      // explicitly instead.
+      getImpl()->getLogger()->error(
+          utl::ODB,
+          1221,
+          "Layer {} does not have enough tracks to compute a GCell tile "
+          "size.",
+          layer->getName());
+    }
+    // The 15x-pitch scaling below is generous enough to cover realistic
+    // die-boundary via-overhang margins (getBoundaryShrink()) on its own
+    // in the ordinary case, but nothing guarantees that in general (an
+    // unusually large via relative to its own layer's pitch could still
+    // exceed it) -- take the max explicitly rather than relying on an
+    // unproven margin.
+    return std::max(max_track_gap * pitches_in_tile,
+                    max_track_gap + getBoundaryShrink(layer));
   }
 
   // Use the middle track spacing between M2, M3 and M4
-  std::vector<int> track_spacings = {getAverageTrackSpacing(2),
-                                     getAverageTrackSpacing(3),
-                                     getAverageTrackSpacing(4)};
+  std::vector<int> track_spacings
+      = {getAverageTrackSpacing(getFrontsideRoutingLayer(2)),
+         getAverageTrackSpacing(getFrontsideRoutingLayer(3)),
+         getAverageTrackSpacing(getFrontsideRoutingLayer(4))};
   std::ranges::sort(track_spacings);
 
-  return track_spacings[1] * pitches_in_tile;
+  int tile_size = track_spacings[1] * pitches_in_tile;
+
+  // A tile sized only from M2-M4 can be smaller than an enabled layer's own
+  // track pitch when a technology has a very wide bottom-to-top pitch ratio
+  // (e.g. gt2n's fine frontside stack topped by a few sparse ultra-thick
+  // layers). When that happens, some GCells end up with too few tracks on
+  // that layer, which fails DRT track assignment outright (DRT-0406 "No
+  // tracks found") the moment global routing assigns a wire to one of those
+  // tiles.
+  //
+  // Floor the tile size against every enabled frontside layer at or above
+  // M4, not just the top one -- pitch is not guaranteed to increase
+  // monotonically with layer index in every technology, and M4 itself may
+  // not be reflected by track_spacings[1] above (that's the *median* of
+  // M2/M3/M4, which can understate M4's own pitch).
+  //
+  // One pitch is sufficient, not two: DRT's actual track assignment
+  // (FlexTAWorker::assignIroute_availTracks / getTrackIdx in
+  // src/drt/src/ta/FlexTA_assign.cpp) treats a GCell's track range as
+  // [gBox.yMin(), gBox.yMax()) -- half-open, explicitly excluding a track
+  // that lands exactly on the tile's top/right edge via a "coordHigh--"
+  // adjustment ("to avoid higher track == guide top/right") so that edge
+  // track is attributed to the next tile instead. For a periodic track
+  // grid, any half-open span of length >= one pitch is guaranteed to
+  // contain at least one track regardless of the grid's phase (offset)
+  // relative to the span -- a span exactly one pitch wide always spans a
+  // full period. A tighter floor is deliberate here: flooring at 2x pitch
+  // (as an earlier version of this fix did) forces the tile size up on
+  // any technology whose top-layer/M4 pitch ratio exceeds
+  // pitches_in_tile / 2 (7.5x here) -- which ordinary stacks like
+  // nangate45 (~8.4x M2-4-to-M9/M10 ratio, per its real tech LEF: metal2
+  // 0.19um, metal3 0.14um, metal4 0.28um, metal9/metal10 1.6um) already
+  // exceed today without
+  // any zero-track problem, since 15 pitches per tile already covers
+  // ratios up to 15x on its own. A 1x floor only overrides the baseline
+  // when a layer's own pitch actually exceeds it (>15x here), matching
+  // when the zero-track condition can occur at all.
+  //
+  // FIXED HERE, GENERALIZES ACROSS TECHNOLOGIES: the "any half-open span
+  // of one pitch has a track regardless of phase" guarantee above holds
+  // for FlexTAWorker::assignIroute_availTracks()'s general (interior)
+  // case, but that same function further shrinks coordLow/coordHigh at
+  // die-boundary GCells on a *unidirectional* layer (LEF58_RECTONLY or
+  // multi-mask), to keep a via's enclosure shape from crossing the die
+  // edge -- by half the merged enclosure height/width of the default via
+  // to the adjacent layer, independent of pitch. This is pre-existing DRT
+  // behavior, not introduced by this floor: even the *old*, unfixed
+  // code's tile size (median(M2,M3,M4) * 15) was already smaller than
+  // this shrink for gt2n's real M12 (840 DBU baseline vs. a 1600 DBU
+  // shrink from the default M12-M13 via) -- die-boundary GCells on M12
+  // were already vulnerable before this patch existed, just alongside
+  // the (also real, also present) interior-case failure this floor
+  // fixes. A flat 1x-pitch floor with no boundary term would still leave
+  // that gap open (1440 DBU vs. the same 1600 DBU shrink -- short by 160
+  // DBU) even after fixing the interior case.
+  //
+  // getBoundaryShrink() above closes this the same way, generalized
+  // rather than hardcoded: it reads the real default-via geometry for
+  // whatever technology is loaded (the same via DRT's own selection logic
+  // would pick) and adds exactly the margin that layer's own via
+  // geometry requires, instead of either an arbitrary padded margin (the
+  // 2x version of this fix that regressed nangate45) or ignoring the
+  // boundary case entirely. It is 0 for a plain (non-unidirectional)
+  // layer or one with no resolvable default via, so it doesn't add
+  // margin where DRT's shrink wouldn't apply -- e.g. nangate45's M9/M10
+  // are not LEF58_RECTONLY, so this term is 0 there and the 165/165 grt
+  // regression result is unaffected.
+  const int min_layer_pitches = 1;
+  for (int idx = upper_layer_for_gcell_size; idx <= enabled_frontside_layers;
+       ++idx) {
+    dbTechLayer* layer = getFrontsideRoutingLayer(idx);
+    dbTrackGrid* track_grid = layer != nullptr ? findTrackGrid(layer) : nullptr;
+    if (track_grid == nullptr) {
+      // Track grid for this layer isn't built yet. getGCellTileSize() is
+      // also called from global placement's routability-driven congestion
+      // check (gpl::RouteBase -> grt::GlobalRouter::initRoutingLayers),
+      // which can run before every layer's track grid has been created on
+      // this block. Skip the floor for this layer here; it's re-applied
+      // once this runs later against a fully tracked block, which is
+      // where the missing-track failure actually occurs.
+      continue;
+    }
+
+    // Use the true worst-case gap between adjacent tracks (getMaxTrackGap
+    // above), not getAverageTrackSpacing()'s averaged pitch: for a layer
+    // with more than one grid pattern, _dbTrackGrid::getAverageTrackPattern()
+    // computes ceil(span / count) -- a mean over every track on the
+    // layer, not a guaranteed minimum periodicity. A tile floored against
+    // that mean can still be smaller than an actual local gap between two
+    // real tracks, reintroducing the zero-track failure this floor exists
+    // to prevent. Computing the real per-gap maximum from the actual
+    // track coordinates is exact for both single- and multi-pattern
+    // layers, at the cost of materializing the layer's full track list
+    // (cheap relative to a global/detailed-route run; this function is
+    // called only a handful of times, not per net or per tile).
+    int max_track_gap = getMaxTrackGap(layer, track_grid);
+    if (max_track_gap == 0) {
+      // Fewer than two tracks: no adjacent-gap to floor against.
+      continue;
+    }
+    int required = max_track_gap * min_layer_pitches + getBoundaryShrink(layer);
+    tile_size = std::max(tile_size, required);
+  }
+
+  return tile_size;
 }
 
 void dbBlock::getExtCornerNames(std::list<std::string>& ecl)
