@@ -400,6 +400,53 @@ TEST_F(TestGCellTileSize, SmallStackUsesWorstGapNotAveragedPitch)
   EXPECT_EQ(block()->getGCellTileSize(), 10000 * 15);
 }
 
+// The small-stack branch's boundary-shrink term
+// (max_track_gap + 2*getBoundaryShrink(layer)) must actually be able to
+// win over its own 15x-pitch side of the max(), the same way the main
+// floor loop's comment notes "nothing guarantees [15x] covers it in
+// general" -- an unusually large via relative to its own layer's fine
+// pitch. M1 here has
+// a fine 40 DBU pitch (15x = 600) but an artificially huge default via
+// enclosure to M2 (2x boundary shrink = 2,000,000), so the boundary term
+// must dominate.
+TEST_F(TestGCellTileSize, SmallStackBoundaryShrinkCanDominate15xPitch)
+{
+  dbTechLayer* m1 = makeRoutingLayer("M1", 40);
+  m1->setRectOnly(true);
+
+  dbTechLayer* cut = dbTechLayer::create(tech(), "V1CUT", dbTechLayerType::CUT);
+  dbTechLayer* m2 = dbTechLayer::create(tech(), "M2", dbTechLayerType::ROUTING);
+  m2->setDirection(dbTechLayerDir::VERTICAL);
+
+  dbTechVia* via = dbTechVia::create(tech(), "V1_0");
+  dbBox::create(via, cut, -10, -10, 10, 10);
+  dbBox::create(via, m1, -50, -50, 50, 50);
+  dbBox::create(via, m2, -1000000, -1000000, 1000000, 1000000);
+
+  block()->setMaxRoutingLayer(1);  // only M1 enabled -- small-stack branch
+
+  // 15x pitch: 40 * 15 = 600. Boundary shrink: merged enclosure height is
+  // 2,000,000 DBU (M1 is HORIZONTAL), so single-end shrink is 1,000,000,
+  // doubled for the both-ends case: 2,000,000. Required:
+  // 40 + 2,000,000 = 2,000,040, which dominates 600.
+  EXPECT_EQ(block()->getGCellTileSize(), 40 + 2 * 1000000);
+}
+
+// The small-stack branch's own upper boundary
+// (enabled_frontside_layers == upper_layer_for_gcell_size - 1, i.e.
+// exactly 3) -- every other small-stack test uses 1 or 2 layers only.
+TEST_F(TestGCellTileSize, SmallStackHandlesExactlyThreeFrontsideLayers)
+{
+  makeRoutingLayer("M1", 60);
+  makeRoutingLayer("M2", 80);
+  makeRoutingLayer("M3", 90);
+  block()->setMaxRoutingLayer(3);
+
+  // Small-stack branch uses M3's own gap (90), not a median of 3 layers
+  // (that path needs 4 enabled layers). 90 * 15 = 1350.
+  EXPECT_EQ(block()->getGCellTileSize(), 90 * 15);
+}
+
 // The floor loop's per-layer requirement must include the die-boundary
 // via-overhang margin (getBoundaryShrink), not just the interior-case
 // track gap, for a layer DRT treats as unidirectional. Uses gt2n's real
@@ -432,9 +479,54 @@ TEST_F(TestGCellTileSize, FloorIncludesBoundaryShrinkForUnidirectionalLayer)
   // Baseline: median(48, 56, 84) * 15 = 840. M12's own interior
   // requirement is its pitch, 1440. The default M12-M13 via's merged
   // enclosure is 800 DBU wide, 3200 DBU tall; M12 is HORIZONTAL, so the
-  // boundary shrink is half the height: 1600. Required for M12:
-  // 1440 + 1600 = 3040, which dominates the 840 baseline.
-  EXPECT_EQ(block()->getGCellTileSize(), 1440 + 1600);
+  // single-end boundary shrink is half the height: 1600. DRT can shrink a
+  // GCell from both ends independently (see getBoundaryShrink()'s
+  // comment), so the floor uses 2x that margin. Required for M12:
+  // 1440 + 2*1600 = 4640, which dominates the 840 baseline.
+  EXPECT_EQ(block()->getGCellTileSize(), 1440 + 2 * 1600);
+}
+
+// getBoundaryShrink()'s above/below physical-adjacency scan (and
+// tech_top_layer) must skip backside layers even when one is interleaved
+// *between* two frontside layers, not just when backside layers all
+// precede the frontside stack (gt2n's real layout, and every other test in
+// this file). DRT's own frTech never contains a backside layer at all
+// (io::Parser::setLayers(), src/drt/src/io/io.cpp filters them out before
+// computing its own top-layer/adjacency notions), so treating one as "the
+// layer above" here would pick the wrong neighbor. Same setup as
+// FloorIncludesBoundaryShrinkForUnidirectionalLayer (M12 RECTONLY,
+// default M12-M13 via), except a backside layer is created between M12 and
+// M13 -- with no via connecting M12 to that backside layer. Before this
+// fix, the above-scan would land on the backside layer first, find no
+// connecting via, and silently return a 0 boundary shrink instead of using
+// the real M12-M13 via -- reproducing the same die-boundary zero-track
+// failure this whole fix exists to close, just for a different (but
+// plausible) backside-layer ordering than gt2n's.
+TEST_F(TestGCellTileSize, BoundaryShrinkSkipsInterleavedBacksideLayer)
+{
+  makeRoutingLayer("M1", kGt2nM3Pitch);
+  makeRoutingLayer("M2", kGt2nM2Pitch);
+  makeRoutingLayer("M3", kGt2nM3Pitch);
+  makeRoutingLayer("M4", kGt2nM4Pitch);
+  dbTechLayer* m12 = makeRoutingLayer("M12", kGt2nTopLayerPitch);
+  m12->setRectOnly(true);
+
+  makeBacksideLayer("BM_INTERLEAVED");  // no via connects to this
+
+  dbTechLayer* m13
+      = dbTechLayer::create(tech(), "M13", dbTechLayerType::ROUTING);
+  m13->setDirection(dbTechLayerDir::VERTICAL);
+
+  dbTechVia* via = dbTechVia::create(tech(), "V12_0");
+  dbBox::create(via, m12, -400, -360, 400, 360);
+  dbBox::create(via, m13, -360, -1600, 360, 1600);
+
+  block()->setMaxRoutingLayer(5);  // M1-M4, M12 enabled; M13 is not
+
+  // Identical math to FloorIncludesBoundaryShrinkForUnidirectionalLayer:
+  // 1440 + 2*1600 = 4640. A buggy above-scan that doesn't skip the
+  // interleaved backside layer would instead get 1440 + 0 = 1440.
+  EXPECT_EQ(block()->getGCellTileSize(), 1440 + 2 * 1600);
 }
 
 // When multiple candidate vias exist between the same two layers,
@@ -502,9 +594,9 @@ TEST_F(TestGCellTileSize, FloorPicksSingleCutDefaultViaAmongMultipleCandidates)
   block()->setMaxRoutingLayer(5);
 
   // Same expected result as FloorIncludesBoundaryShrinkForUnidirectionalLayer
-  // (1440 + 1600 = 3040) -- proves the right via was picked out of three,
-  // not just the only one available.
-  EXPECT_EQ(block()->getGCellTileSize(), 1440 + 1600);
+  // (1440 + 2*1600 = 4640) -- proves the right via was picked out of
+  // three, not just the only one available.
+  EXPECT_EQ(block()->getGCellTileSize(), 1440 + 2 * 1600);
 }
 
 // getBoundaryShrink() must also apply when `layer` is the tech's own
@@ -530,9 +622,10 @@ TEST_F(TestGCellTileSize, BoundaryShrinkLooksBelowForTechsPhysicalTopLayer)
   block()->setMaxRoutingLayer(4);
 
   // Baseline: median(48, 56, 84) * 15 = 840. M4's own gap is 84; its
-  // boundary shrink (M4 is HORIZONTAL) is half the merged enclosure
-  // height: 1600. Required: 84 + 1600 = 1684, which dominates.
-  EXPECT_EQ(block()->getGCellTileSize(), 84 + 1600);
+  // single-end boundary shrink (M4 is HORIZONTAL) is half the merged
+  // enclosure height: 1600, doubled for the both-ends case. Required:
+  // 84 + 2*1600 = 3284, which dominates.
+  EXPECT_EQ(block()->getGCellTileSize(), 84 + 2 * 1600);
 }
 
 // If no via at all connects a unidirectional layer to its neighbor,
