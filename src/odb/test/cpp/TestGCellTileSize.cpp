@@ -634,6 +634,58 @@ TEST_F(TestGCellTileSize, FloorPicksSingleCutDefaultViaAmongMultipleCandidates)
   EXPECT_EQ(block()->getGCellTileSize(), 1440 + 2 * 1600);
 }
 
+// When two candidate vias tie on both cut count and the DEFAULT flag,
+// findConnectingVia() must fall through to getViaRawPriority()'s own
+// tiebreak (mirrored by getViaPriority()): the narrower bottom-layer
+// (M12) enclosure wins. Both candidates here are single-cut and neither
+// is marked DEFAULT, so cut count and DEFAULT tie completely -- only the
+// M12 width differs. Each candidate's own M13 enclosure differs too, so
+// the resulting tile size directly reveals which via was actually
+// picked: the wrong pick (wider-M12 via, whose M13 box is much taller)
+// would produce a visibly different, larger tile size.
+TEST_F(TestGCellTileSize, FloorPicksNarrowerEnclosureOnFullTie)
+{
+  makeRoutingLayer("M1", kGt2nM3Pitch);
+  makeRoutingLayer("M2", kGt2nM2Pitch);
+  makeRoutingLayer("M3", kGt2nM3Pitch);
+  makeRoutingLayer("M4", kGt2nM4Pitch);
+  dbTechLayer* m12 = makeRoutingLayer("M12", kGt2nTopLayerPitch);
+  m12->setRectOnly(true);
+
+  dbTechLayer* cut
+      = dbTechLayer::create(tech(), "V12CUT", dbTechLayerType::CUT);
+  dbTechLayer* m13
+      = dbTechLayer::create(tech(), "M13", dbTechLayerType::ROUTING);
+  m13->setDirection(dbTechLayerDir::VERTICAL);
+
+  // Wider M12 enclosure (200x200, lower_width=200), tall M13 enclosure --
+  // must lose the tiebreak. If wrongly picked, the merged M12+M13 box's
+  // Y-extent would be 4000 (M13's -2000..2000), giving a much larger
+  // margin than the correct pick below.
+  dbTechVia* wide_via = dbTechVia::create(tech(), "V12_WIDE");
+  dbBox::create(wide_via, cut, -20, -20, 20, 20);
+  dbBox::create(wide_via, m12, -100, -100, 100, 100);
+  dbBox::create(wide_via, m13, -50, -2000, 50, 2000);
+
+  // Narrower M12 enclosure (50x50, lower_width=50) -- must win the
+  // tiebreak (same cut count, same non-DEFAULT status as wide_via
+  // above).
+  dbTechVia* narrow_via = dbTechVia::create(tech(), "V12_NARROW");
+  dbBox::create(narrow_via, cut, -20, -20, 20, 20);
+  dbBox::create(narrow_via, m12, -25, -25, 25, 25);
+  dbBox::create(narrow_via, m13, -50, -500, 50, 500);
+
+  block()->setMaxRoutingLayer(5);
+
+  // Correct pick (narrow_via): merged M12+M13 box is x:[-50,50] (100),
+  // y:[-500,500] (1000) -- M12 is HORIZONTAL, so single-end shrink is
+  // half the Y-extent: 500, doubled for both-ends: 1000. Required for
+  // M12: 1440 + 1000 = 2440, which dominates the 840 baseline.
+  // Picking wide_via instead would give 1440 + 2*2000 = 5440 -- clearly
+  // distinguishable from the correct answer.
+  EXPECT_EQ(block()->getGCellTileSize(), 1440 + 2 * 500);
+}
+
 // getBoundaryShrink() must also apply when `layer` is the tech's own
 // physical top (no layer above it at all) -- it should look at the via
 // connecting it to the layer *below* instead, mirroring DRT's own
