@@ -185,6 +185,30 @@ TEST_F(TestGCellTileSize, FloorConsidersEveryLayerNotJustTheTop)
   EXPECT_EQ(block()->getGCellTileSize(), 3000);
 }
 
+// GlobalRouter::getMinMaxLayer() grids up to
+// max(getMaxRoutingLayer(), getMaxLayerForClock()), since
+// -max_layer_for_clock/set_routing_layers -clock_layers can allow clock
+// nets onto a layer above max_routing_layer_. getGCellTileSize() must
+// floor against that same effective max, or a coarse clock-only layer
+// reintroduces DRT-0406 through a path this function never saw.
+TEST_F(TestGCellTileSize, FloorConsidersMaxLayerForClockAboveMaxRoutingLayer)
+{
+  makeRoutingLayer("M1", 60);
+  makeRoutingLayer("M2", 80);
+  makeRoutingLayer("M3", 90);
+  makeRoutingLayer("M4", 100);
+  makeRoutingLayer("M5", 200);
+  makeRoutingLayer("M6", 3000);  // clock-only layer, above max_routing_layer_
+  block()->setMaxRoutingLayer(5);
+  block()->setMaxLayerForClock(6);
+
+  // Baseline: median(80, 90, 100) * 15 = 1350. Ignoring max_layer_for_clock,
+  // the floor loop would stop at M5 (200): max(1350, 100, 200) = 1350,
+  // smaller than M6's own pitch (3000) -- reproducing DRT-0406 on the
+  // clock-only layer. Accounting for it extends the floor through M6.
+  EXPECT_EQ(block()->getGCellTileSize(), 3000);
+}
+
 // Regression test for a second bug found while generalizing the fix, in the
 // already-merged backside-skip code this patch builds on (not introduced by
 // this patch): max_routing_layer_ is a *raw* routing level that counts
@@ -465,6 +489,25 @@ TEST_F(TestGCellTileSize, SmallStackBoundaryShrinkCanDominate15xPitch)
   // doubled for the both-ends case: 2,000,000. Required:
   // 40 + 2,000,000 = 2,000,040, which dominates 600.
   EXPECT_EQ(block()->getGCellTileSize(), 40 + 2 * 1000000);
+}
+
+// The small-stack (<4 frontside layers) branch has no M2-M4 baseline to
+// fall back on, so it must check every enabled layer directly, the same
+// reason FloorConsidersEveryLayerNotJustTheTop checks every layer in the
+// >=4-layer floor loop instead of only the top -- pitch isn't guaranteed
+// to increase monotonically with layer index here either. Here the widest
+// layer (M1) sits *below* the top layer (M3); checking only the top layer
+// (an earlier version of this branch) would miss M1 entirely.
+TEST_F(TestGCellTileSize, SmallStackConsidersEveryLayerNotJustTheTop)
+{
+  makeRoutingLayer("M1", 200);  // widest layer, not the top
+  makeRoutingLayer("M2", 60);
+  makeRoutingLayer("M3", 90);      // top layer, narrower than M1
+  block()->setMaxRoutingLayer(3);  // 3 frontside layers -- small-stack branch
+
+  // Top-layer-only would give 90 * 15 = 1350, missing M1's own wider pitch
+  // (200 * 15 = 3000) entirely.
+  EXPECT_EQ(block()->getGCellTileSize(), 200 * 15);
 }
 
 // The small-stack branch's own upper boundary
