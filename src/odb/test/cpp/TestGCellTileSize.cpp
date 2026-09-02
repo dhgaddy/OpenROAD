@@ -278,7 +278,14 @@ TEST_F(TestGCellTileSize, ErrorsWhenMaxRoutingLayerNotSet)
   makeRoutingLayer("M4", 100);
   // Deliberately no block()->setMaxRoutingLayer() call.
 
-  EXPECT_THROW(block()->getGCellTileSize(), std::runtime_error);
+  try {
+    block()->getGCellTileSize();
+    FAIL() << "Expected ODB-1219";
+  } catch (const std::exception& e) {
+    EXPECT_STREQ(e.what(), "ODB-1219");
+  } catch (...) {
+    FAIL() << "Unexpected exception (other than ODB-1219)";
+  }
 }
 
 // 0 is likewise never a real dbTechLayer::getRoutingLevel() value (routing
@@ -294,7 +301,14 @@ TEST_F(TestGCellTileSize, ErrorsWhenMaxRoutingLayerIsZero)
   makeRoutingLayer("M4", 100);
   block()->setMaxRoutingLayer(0);
 
-  EXPECT_THROW(block()->getGCellTileSize(), std::runtime_error);
+  try {
+    block()->getGCellTileSize();
+    FAIL() << "Expected ODB-1219";
+  } catch (const std::exception& e) {
+    EXPECT_STREQ(e.what(), "ODB-1219");
+  } catch (...) {
+    FAIL() << "Unexpected exception (other than ODB-1219)";
+  }
 }
 
 // Pins the floor loop's early-call tolerance: getGCellTileSize() can run
@@ -331,7 +345,14 @@ TEST_F(TestGCellTileSize, ErrorsOnLayerWithNoDirectionSet)
   makeNoDirectionRoutingLayer("M5", 3000);
   block()->setMaxRoutingLayer(5);
 
-  EXPECT_THROW(block()->getGCellTileSize(), std::runtime_error);
+  try {
+    block()->getGCellTileSize();
+    FAIL() << "Expected ODB-1220";
+  } catch (const std::exception& e) {
+    EXPECT_STREQ(e.what(), "ODB-1220");
+  } catch (...) {
+    FAIL() << "Unexpected exception (other than ODB-1220)";
+  }
 }
 
 // An odd max_track_gap must round *up* to the nearest even value, not
@@ -366,7 +387,14 @@ TEST_F(TestGCellTileSize, ErrorsOnInsufficientTracksInSmallStack)
   makeSingleTrackRoutingLayer("M2");
   block()->setMaxRoutingLayer(2);
 
-  EXPECT_THROW(block()->getGCellTileSize(), std::runtime_error);
+  try {
+    block()->getGCellTileSize();
+    FAIL() << "Expected ODB-1221";
+  } catch (const std::exception& e) {
+    EXPECT_STREQ(e.what(), "ODB-1221");
+  } catch (...) {
+    FAIL() << "Unexpected exception (other than ODB-1221)";
+  }
 }
 
 // max_routing_layer_ can resolve to a raw level whose every ROUTING layer
@@ -380,7 +408,14 @@ TEST_F(TestGCellTileSize, ErrorsWhenNoFrontsideLayerEnabled)
   ASSERT_EQ(b1->getRoutingLevel(), 1);
   block()->setMaxRoutingLayer(2);  // both enabled layers are backside
 
-  EXPECT_THROW(block()->getGCellTileSize(), std::runtime_error);
+  try {
+    block()->getGCellTileSize();
+    FAIL() << "Expected ODB-1222";
+  } catch (const std::exception& e) {
+    EXPECT_STREQ(e.what(), "ODB-1222");
+  } catch (...) {
+    FAIL() << "Unexpected exception (other than ODB-1222)";
+  }
 }
 
 // The small-stack (<4 frontside layers) branch switched from
@@ -662,7 +697,14 @@ TEST_F(TestGCellTileSize, ErrorsWhenMaxRoutingLayerExceedsLayerCount)
   makeRoutingLayer("M4", 100);
   block()->setMaxRoutingLayer(5);  // only 4 routing layers exist
 
-  EXPECT_THROW(block()->getGCellTileSize(), std::runtime_error);
+  try {
+    block()->getGCellTileSize();
+    FAIL() << "Expected ODB-1223";
+  } catch (const std::exception& e) {
+    EXPECT_STREQ(e.what(), "ODB-1223");
+  } catch (...) {
+    FAIL() << "Unexpected exception (other than ODB-1223)";
+  }
 }
 
 // The small-stack branch's requireTrackGrid() call still hard-errors with
